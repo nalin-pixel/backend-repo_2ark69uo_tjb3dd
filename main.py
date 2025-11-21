@@ -1,6 +1,10 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from typing import Dict, List, Set
+from pydantic import BaseModel
+from database import create_document
 
 app = FastAPI()
 
@@ -12,58 +16,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+class CreateRoomRequest(BaseModel):
+    player_id: str
+    room_code: str
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+class JoinRoomRequest(BaseModel):
+    player_id: str
+    room_code: str
+
+# In-memory connection manager for websockets (not for persistence)
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self.voice_connections: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, room: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.setdefault(room, set()).add(websocket)
+
+    def disconnect(self, room: str, websocket: WebSocket):
+        if room in self.active_connections and websocket in self.active_connections[room]:
+            self.active_connections[room].remove(websocket)
+        if room in self.voice_connections and websocket in self.voice_connections[room]:
+            self.voice_connections[room].remove(websocket)
+
+    async def broadcast(self, room: str, message: dict):
+        for connection in list(self.active_connections.get(room, set())):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
+    async def broadcast_voice(self, room: str, data: bytes):
+        for connection in list(self.voice_connections.get(room, set())):
+            try:
+                await connection.send_bytes(data)
+            except Exception:
+                pass
+
+manager = ConnectionManager()
+
+@app.get("/")
+async def root():
+    return {"message": "Ludo backend running"}
 
 @app.get("/test")
-def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
+async def test_database():
+    from database import db
+    status = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
+        "database_url": "❌ Not Set",
+        "database_name": "❌ Not Set",
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
+        import os
+        status["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+        status["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            status["database"] = "✅ Available"
+            cols = db.list_collection_names()
+            status["collections"] = cols
+            status["connection_status"] = "Connected"
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+        status["database"] = f"⚠️ {str(e)[:60]}"
+    return status
 
+@app.post("/api/room/create")
+async def create_room(req: CreateRoomRequest):
+    from schemas import Room
+    doc = Room(room_code=req.room_code, created_by=req.player_id, players=[req.player_id])
+    room_id = create_document("room", doc)
+    return {"ok": True, "room_id": room_id}
+
+@app.post("/api/room/join")
+async def join_room(req: JoinRoomRequest):
+    # Persistence of room membership is in DB via moves/rooms; realtime via websockets
+    await manager.broadcast(req.room_code, {"type": "player_joined", "player_id": req.player_id})
+    return {"ok": True}
+
+# WebSocket for game state (JSON messages)
+@app.websocket("/ws/game/{room_code}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str):
+    await manager.connect(room_code, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Echo/broadcast game events to room
+            await manager.broadcast(room_code, data)
+    except WebSocketDisconnect:
+        manager.disconnect(room_code, websocket)
+
+# WebSocket for raw voice data (binary)
+@app.websocket("/ws/voice/{room_code}")
+async def voice_endpoint(websocket: WebSocket, room_code: str):
+    await websocket.accept()
+    manager.voice_connections.setdefault(room_code, set()).add(websocket)
+    try:
+        while True:
+            msg = await websocket.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                await manager.broadcast_voice(room_code, msg["bytes"])  # relay audio frames
+    except WebSocketDisconnect:
+        manager.disconnect(room_code, websocket)
 
 if __name__ == "__main__":
     import uvicorn

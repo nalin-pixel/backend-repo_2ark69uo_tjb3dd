@@ -12,7 +12,8 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 # Example schemas (replace with your own):
 
@@ -37,6 +38,33 @@ class Product(BaseModel):
     price: float = Field(..., ge=0, description="Price in dollars")
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
+
+# Ludo game schemas
+
+class Room(BaseModel):
+    """
+    Ludo room schema
+    Collection name: "room"
+    """
+    room_code: str = Field(..., description="Short code to join the room")
+    created_by: str = Field(..., description="Player ID of the creator")
+    status: str = Field("waiting", description="waiting | playing | finished")
+    players: List[str] = Field(default_factory=list, description="List of player IDs in join order")
+    max_players: int = Field(4, ge=2, le=4)
+    created_at: Optional[datetime] = None
+
+class Move(BaseModel):
+    """
+    Ludo move schema
+    Collection name: "move"
+    """
+    room_code: str
+    player_id: str
+    piece: str = Field(..., description="Which piece was moved (e.g., R1, G2)")
+    from_pos: int = Field(..., ge=-1, le=57, description="-1 for home, 0-57 board index")
+    to_pos: int = Field(..., ge=0, le=57)
+    dice: int = Field(..., ge=1, le=6)
+    created_at: Optional[datetime] = None
 
 # Add your own schemas here:
 # --------------------------------------------------
